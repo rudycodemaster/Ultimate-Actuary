@@ -417,3 +417,207 @@ ggplot(frecuencia_marca, aes(x = reorder(Marca, -Frecuencia), y = Frecuencia, fi
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 #-----------------------------------------------------------------------
+install.packages("readxl")
+
+# Cargar librerías necesarias
+library(readxl)
+library(MASS)  
+library(VGAM)  
+library(dplyr) # Para manipulación de datos
+library(fitdistrplus) 
+library(ggplot2)     # Para gráficos
+library(goftest)     # Para pruebas KS y Anderson-Darling
+
+
+
+
+datos<-read_excel("C:/Users/omarp/Downloads/DBMS.xlsx")
+# Filtrar para eliminar niveles con solo un valor 
+sapply(lapply(datos, unique), length)
+######### Datos totales Frecuencia
+# Modelo Poisson
+modelo_poisson <- glm(Numero_de_Vehiculos ~  Marca + Cobertura + 
+                        Tipo_de_Perdida + Causa_del_siniestro, 
+                      data = datos, family = poisson(link = "log"))
+
+
+# Modelo Binomial Negativa
+modelo_bin_neg <- glm.nb(Numero_de_Vehiculos ~  Marca + Cobertura + 
+                            Tipo_de_Perdida + Causa_del_siniestro, 
+                         data = datos)
+
+# Modelo Geométrico (caso especial de Binomial Negativa con theta = 1)
+modelo_geom <- vglm(
+  Numero_de_Vehiculos ~ Marca + Cobertura + Tipo_de_Perdida + Causa_del_siniestro,
+  data = datos,
+  family = geometric()  # o geometricff()
+)
+
+# Comparar modelos con AIC (menor es mejor)
+aic_values <- data.frame(
+  Modelo = c("Poisson", "Binomial Negativa", "Geométrica"),
+  AIC = c(AIC(modelo_poisson), AIC(modelo_bin_neg), AIC(modelo_geom))
+)
+
+print(aic_values)
+
+#### Recomendación
+resumen_marcas <- datos %>%
+  group_by(Marca) %>%
+  summarise(
+    media_frec = mean(Numero_de_Vehiculos, na.rm = TRUE),
+    varianza_frec = var(Numero_de_Vehiculos, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Función para recomendar distribución según media y varianza
+resumen_marcas <- resumen_marcas %>%
+  mutate(
+    recomendacion = case_when(
+      abs(media_frec - varianza_frec) < 0.1 * media_frec ~ "Poisson",
+      varianza_frec < media_frec ~ "Binomial",
+      varianza_frec > media_frec ~ "Binomial Negativa o Geométrica"
+    )
+  )
+
+# Estimación de parámetros usando el método de momentos
+resumen_marcas <- resumen_marcas %>%
+  mutate(
+    # Parámetros de la distribución de Poisson
+    lambda_poisson = ifelse(recomendacion == "Poisson", media_frec, NA),
+    
+    # Parámetros de la distribución Binomial (Método de Momentos)
+    n_binomial = ifelse(recomendacion == "Binomial", 
+                        round((media_frec^2) / (varianza_frec - media_frec)), NA),
+    p_binomial = ifelse(recomendacion == "Binomial", 
+                        media_frec / n_binomial, NA),
+    
+    # Parámetros de la distribución Binomial Negativa o Geométrica (Método de Momentos)
+    r_binomial_negativa = ifelse(recomendacion == "Binomial Negativa o Geométrica", 
+                                 round((media_frec^2) / (varianza_frec - media_frec)), NA),
+    # Asegurar que r_binomial_negativa sea al menos 1
+    r_binomial_negativa = ifelse(r_binomial_negativa < 1, 1, r_binomial_negativa),
+    
+    p_binomial_negativa = ifelse(recomendacion == "Binomial Negativa o Geométrica", 
+                                 media_frec / varianza_frec, NA)
+  )
+
+
+# Mostrar la tabla con los resultados
+print(resumen_marcas)
+################################
+
+
+# Bucle para entrenar un modelo por cada marca
+
+
+for (marca in marcas_unicas) {
+  # Filtrar datos de la marca específica
+  datos_marca <- filter(datos, Marca == marca)
+  
+  # Calcular media y varianza
+  media_frec <- mean(datos_marca$Numero_de_Vehiculos)
+  varianza_frec <- var(datos_marca$Numero_de_Vehiculos)
+  
+  # Elegir distribución según relación media-varianza
+  if (abs(media_frec - varianza_frec) < 0.1 * media_frec) {
+    distribucion <- poisson(link = "log")
+    modelo <- glm(Numero_de_Vehiculos ~  Cobertura + Tipo_de_Perdida + Causa_del_siniestro,
+                  data = datos_marca, family = distribucion)
+  } else if (varianza_frec < media_frec) {
+    distribucion <- binomial(link = "logit")
+    modelo <- glm(Numero_de_Vehiculos ~  Cobertura + Tipo_de_Perdida + Causa_del_siniestro,
+                  data = datos_marca, family = distribucion)
+  } else {
+    distribucion <- negative.binomial(theta = 1)
+    modelo <- glm.nb(Numero_de_Vehiculos ~  Cobertura + Tipo_de_Perdida + Causa_del_siniestro,
+                     data = datos_marca)
+  }
+  
+  # Guardar el modelo en la lista con el nombre de la marca
+  modelos_glm[[marca]] <- modelo
+  
+  # Imprimir resumen del modelo
+  cat("\nResumen del modelo para la marca:", marca, "\n")
+  print(summary(modelo))
+}
+
+
+
+########### Severidad #######
+# Obtener la lista de marcas únicas
+marcas_unicas <- unique(datos$Marca)
+
+# Crear una lista vacía para guardar los parámetros por marca
+resultados_severidad <- list()
+
+# Función para estimar parámetros por Método de Momentos
+ajustar_mm <- function(datos) {
+  media <- mean(datos)
+  varianza <- var(datos)
+  
+  # Exponencial (lambda = 1/media)
+  lambda_exp <- 1 / media
+  
+  # Gamma (shape = media^2 / varianza, scale = varianza / media)
+  shape_gamma <- media^2 / varianza
+  scale_gamma <- varianza / media
+  
+  # Pareto (alpha = 2 + media^2 / (varianza - media^2), beta = media * (alpha - 1))
+  alpha_pareto <- ifelse(varianza > media^2, 2 + media^2 / (varianza - media^2), NA)
+  beta_pareto <- ifelse(!is.na(alpha_pareto), media * (alpha_pareto - 1), NA)
+  
+  # Burr (aproximación, ajuste simplificado)
+  c_burr <- 1 + media^2 / varianza
+  k_burr <- 2
+  
+  return(list(
+    Exponencial = list(lambda = lambda_exp),
+    Gamma = list(shape = shape_gamma, scale = scale_gamma),
+    Pareto = list(alpha = alpha_pareto, beta = beta_pareto),
+    Burr = list(c = c_burr, k = k_burr)
+  ))
+}
+
+# Bucle para entrenar modelos por cada marca
+for (marca in marcas_unicas) {
+  cat("\n-------------------------------\n")
+  cat("Modelando severidad para la marca:", marca, "\n")
+  cat("-------------------------------\n")
+  
+  # Filtrar datos de la marca específica
+  datos_marca <- filter(datos, Marca == marca)$Monto_de_Siniestros
+  
+  # Filtrar valores negativos o ceros
+  datos_marca <- datos_marca[datos_marca > 0]
+  
+  # Verificar si hay suficientes datos
+  if (length(datos_marca) < 10) {
+    cat("⚠️ Insuficientes datos para modelar severidad en", marca, "\n")
+    next
+  }
+  
+  # 📌 Método de Momentos
+  parametros_mm <- ajustar_mm(datos_marca)
+  
+  # 📌 Máxima Verosimilitud con validaciones
+  fit_exp <- tryCatch(fitdistr(datos_marca, "exponential"), error = function(e) NULL)
+  fit_gamma <- tryCatch(fitdistr(datos_marca, "gamma", start = list(shape = 2, rate = 1 / mean(datos_marca))), error = function(e) NULL)
+  fit_pareto <- tryCatch(vglm(datos_marca ~ 1, family = paretoII, data = data.frame(datos_marca)), error = function(e) NULL)
+  fit_burr <- tryCatch(vglm(datos_marca ~ 1, family = burr, data = data.frame(datos_marca)), error = function(e) NULL)
+  
+  parametros_mle <- list(
+    Exponencial = if (!is.null(fit_exp)) fit_exp$estimate else "Error",
+    Gamma = if (!is.null(fit_gamma)) fit_gamma$estimate else "Error",
+    Pareto = if (!is.null(fit_pareto)) coef(fit_pareto) else "Error",
+    Burr = if (!is.null(fit_burr)) coef(fit_burr) else "Error"
+  )
+  
+  # Guardar resultados
+  resultados_severidad[[marca]] <- list(
+    Metodo_Momentos = parametros_mm,
+    Maxima_Verosimilitud = parametros_mle
+  )
+  
+  print(resultados_severidad[[marca]])
+}
